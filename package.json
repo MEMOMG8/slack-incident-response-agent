@@ -1,14 +1,20 @@
-﻿{
-  "name": "slack-incident-response-agent",
-  "version": "1.0.0",
-  "description": "Intelligent Slack agent for incident response",
-  "main": "src/index.ts",
-  "scripts": {
-    "dev": "slack run",
-    "build": "slack build"
-  },
-  "dependencies": {
-    "@slack/bolt": "^3.17.0",
-    "@slack/web-api": "^6.9.0"
-  }
+{
+    "version":  "1.0.0",
+    "name":  "slack-incident-response-agent",
+    "description":  "Intelligent Slack agent for incident response",
+    "scripts":  {
+                    "dev":  "ts-node src/index.ts",
+                    "build":  "tsc"
+                },
+    "dependencies":  {
+                         "dotenv":  "^16.3.1",
+                         "@slack/web-api":  "^6.9.0",
+                         "@slack/bolt":  "^3.17.0"
+                     },
+    "devDependencies":  {
+                            "typescript":  "^5.2.0",
+                            "ts-node":  "^10.9.1",
+                            "@types/node":  "^20.0.0"
+                        },
+    "main":  "src/index.ts"
 }
