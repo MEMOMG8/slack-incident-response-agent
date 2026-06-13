@@ -1,0 +1,14 @@
+﻿{
+  "name": "slack-incident-response-agent",
+  "version": "1.0.0",
+  "description": "Intelligent Slack agent for incident response",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "slack run",
+    "build": "slack build"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.17.0",
+    "@slack/web-api": "^6.9.0"
+  }
+}
