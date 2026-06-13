@@ -84,7 +84,6 @@ interface HistoricalIncident {
   occurredDaysAgo: number;
 }
 
-// Base de conocimiento de incidentes pasados, organizada por servicio
 const historicalDatabase: Record<string, HistoricalIncident[]> = {
   'Payment Service': [
     {
@@ -152,9 +151,79 @@ function searchHistoricalIncidents(service: string): HistoricalIncident[] {
   return historicalDatabase[service] || [];
 }
 
+// ==================== ESCALACION (MCP) ====================
+
+interface EscalationResult {
+  channelId: string;
+  channelName: string;
+}
+
+async function escalateIncident(
+  client: any,
+  classification: ClassifiedIncident,
+  reporterId: string | undefined,
+  originalText: string
+): Promise<EscalationResult | null> {
+  const channelName = `incident-${Date.now().toString(36)}`.toLowerCase();
+
+  try {
+    const createResult = await client.conversations.create({
+      name: channelName,
+      is_private: false,
+    });
+
+    const channelId = createResult.channel.id;
+    const channelNameActual = createResult.channel.name;
+
+    if (reporterId) {
+      try {
+        await client.conversations.invite({
+          channel: channelId,
+          users: reporterId,
+        });
+      } catch (inviteError) {
+        console.log('No se pudo invitar al usuario al canal:', inviteError);
+      }
+    }
+
+    await client.chat.postMessage({
+      channel: channelId,
+      text: `Incidente critico: ${classification.service}`,
+      blocks: [
+        {
+          type: 'header',
+          text: {
+            type: 'plain_text',
+            text: `Incidente CRITICO: ${classification.service}`,
+          },
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*Descripcion original:*\n${originalText}\n\n*Severidad:* ${classification.severity}\n*Servicio:* ${classification.service}`,
+          },
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: ':robot_face: Este canal fue creado automaticamente por el Incident Response Agent para coordinar la respuesta a este incidente.',
+          },
+        },
+      ],
+    });
+
+    return { channelId, channelName: channelNameActual };
+  } catch (error) {
+    console.error('Error creando canal de escalacion:', error);
+    return null;
+  }
+}
+
 // ==================== HANDLER ====================
 
-app.message(async ({ message, say }) => {
+app.message(async ({ message, say, client }) => {
   const msg = message as any;
   if (!msg.text) return;
 
@@ -163,6 +232,7 @@ app.message(async ({ message, say }) => {
   const classification = classifyAlert(msg.text);
 
   await say({
+    text: `Incidente clasificado: ${classification.severity}`,
     blocks: [
       {
         type: 'header',
@@ -229,6 +299,7 @@ app.message(async ({ message, say }) => {
       .join('\n\n');
 
     await say({
+      text: `Incidentes similares encontrados (${similarIncidents.length})`,
       blocks: [
         {
           type: 'section',
@@ -250,6 +321,7 @@ app.message(async ({ message, say }) => {
     });
   } else {
     await say({
+      text: 'No se encontraron incidentes historicos similares',
       blocks: [
         {
           type: 'section',
@@ -260,6 +332,28 @@ app.message(async ({ message, say }) => {
         },
       ],
     });
+  }
+
+  // ===== Escalacion automatica (MCP) =====
+  if (classification.severity === 'CRITICAL') {
+    const escalation = await escalateIncident(client, classification, msg.user, msg.text);
+
+    if (escalation) {
+      await say({
+        text: `Incidente escalado automaticamente a #${escalation.channelName}`,
+        blocks: [
+          {
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: `:rotating_light: *Incidente escalado automaticamente*\nSe creo el canal <#${escalation.channelId}> para coordinar la respuesta a este incidente.`,
+            },
+          },
+        ],
+      });
+    } else {
+      await say('No se pudo escalar automaticamente el incidente. Revisa los permisos del bot (channels:manage).');
+    }
   }
 });
 
