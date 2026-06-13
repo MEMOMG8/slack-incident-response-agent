@@ -23,7 +23,6 @@ interface ClassifiedIncident {
 function classifyAlert(text: string): ClassifiedIncident {
   const lowerText = text.toLowerCase();
 
-  // Determinar severidad
   let severity: Severity = 'LOW';
   let confidence = 0.5;
 
@@ -42,7 +41,6 @@ function classifyAlert(text: string): ClassifiedIncident {
     confidence = 0.75;
   }
 
-  // Determinar servicio
   const serviceKeywords: Record<string, string> = {
     payment: 'Payment Service',
     pago: 'Payment Service',
@@ -75,6 +73,83 @@ function classifyAlert(text: string): ClassifiedIncident {
     emoji: emojiMap[severity],
     confidence,
   };
+}
+
+// ==================== REAL-TIME SEARCH (HISTORICO) ====================
+
+interface HistoricalIncident {
+  title: string;
+  resolution: string;
+  timeToResolveMinutes: number;
+  occurredDaysAgo: number;
+}
+
+// Base de conocimiento de incidentes pasados, organizada por servicio
+const historicalDatabase: Record<string, HistoricalIncident[]> = {
+  'Payment Service': [
+    {
+      title: 'Payment Service timeout bajo alta carga',
+      resolution: 'Se escalo el numero de pods de 3 a 8 y se aumento el timeout de 5s a 15s',
+      timeToResolveMinutes: 28,
+      occurredDaysAgo: 14,
+    },
+    {
+      title: 'Payment Service caido tras deploy',
+      resolution: 'Rollback al deploy anterior, el nuevo build tenia una variable de entorno faltante',
+      timeToResolveMinutes: 12,
+      occurredDaysAgo: 45,
+    },
+  ],
+  Database: [
+    {
+      title: 'Database connection pool agotado',
+      resolution: 'Se habilito connection pooling y se redujeron las conexiones max de 500 a 100',
+      timeToResolveMinutes: 35,
+      occurredDaysAgo: 7,
+    },
+    {
+      title: 'Database con latencia alta en queries',
+      resolution: 'Se agrego un indice faltante en la tabla de transacciones',
+      timeToResolveMinutes: 50,
+      occurredDaysAgo: 30,
+    },
+  ],
+  'API Gateway': [
+    {
+      title: 'API Gateway con memory leak',
+      resolution: 'Se reinicio el servicio y se aplico el fix del commit abc123 en el siguiente deploy',
+      timeToResolveMinutes: 20,
+      occurredDaysAgo: 10,
+    },
+  ],
+  'Cache Service': [
+    {
+      title: 'Cache Service con hit rate bajo',
+      resolution: 'Se aumento el TTL de las claves frecuentes y se aumento la memoria asignada',
+      timeToResolveMinutes: 40,
+      occurredDaysAgo: 21,
+    },
+  ],
+  'Authentication Service': [
+    {
+      title: 'Authentication Service rechazando tokens validos',
+      resolution: 'El reloj del servidor estaba desincronizado, se resincronizo con NTP',
+      timeToResolveMinutes: 18,
+      occurredDaysAgo: 5,
+    },
+  ],
+  'Notification Service': [
+    {
+      title: 'Notification Service con cola atascada',
+      resolution: 'Se purgaron mensajes duplicados en la cola y se reinicio el worker',
+      timeToResolveMinutes: 22,
+      occurredDaysAgo: 18,
+    },
+  ],
+};
+
+function searchHistoricalIncidents(service: string): HistoricalIncident[] {
+  return historicalDatabase[service] || [];
 }
 
 // ==================== HANDLER ====================
@@ -142,6 +217,50 @@ app.message(async ({ message, say }) => {
       },
     ],
   });
+
+  // ===== Buscar contexto historico (Real-Time Search) =====
+  const similarIncidents = searchHistoricalIncidents(classification.service);
+
+  if (similarIncidents.length > 0) {
+    const historyText = similarIncidents
+      .map((inc) => {
+        return `*${inc.title}*\n_Hace ${inc.occurredDaysAgo} dias - resuelto en ${inc.timeToResolveMinutes} min_\nSolucion: ${inc.resolution}`;
+      })
+      .join('\n\n');
+
+    await say({
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `:mag: *Incidentes similares encontrados (${similarIncidents.length})*\n\n${historyText}`,
+          },
+        },
+        {
+          type: 'context',
+          elements: [
+            {
+              type: 'mrkdwn',
+              text: 'Resultados de Real-Time Search sobre el historial de incidentes',
+            },
+          ],
+        },
+      ],
+    });
+  } else {
+    await say({
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `:mag: No se encontraron incidentes historicos similares para *${classification.service}*. Este podria ser un caso nuevo.`,
+          },
+        },
+      ],
+    });
+  }
 });
 
 // ==================== ACCIONES ====================
