@@ -1,6 +1,7 @@
 import { App } from '@slack/bolt';
 import * as dotenv from 'dotenv';
 import * as path from 'path';
+import { escalateIncident as escalateViaMcp } from './mcp-client';
 
 dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 
@@ -9,15 +10,20 @@ const app = new App({
   signingSecret: process.env.SLACK_SIGNING_SECRET!,
 });
 
-// ==================== CLASIFICACION ====================
+// ==================== CLASSIFICATION (Slack AI) ====================
 
 type Severity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
 
 interface ClassifiedIncident {
+  id: string;
   severity: Severity;
   service: string;
   emoji: string;
   confidence: number;
+}
+
+function generateIncidentId(): string {
+  return `INC-${Date.now().toString(36).toUpperCase()}`;
 }
 
 function classifyAlert(text: string): ClassifiedIncident {
@@ -26,9 +32,9 @@ function classifyAlert(text: string): ClassifiedIncident {
   let severity: Severity = 'LOW';
   let confidence = 0.5;
 
-  const criticalKeywords = ['down', 'outage', 'critical', 'caido', 'caída', 'emergencia'];
-  const highKeywords = ['error', 'failure', 'exhausted', 'high cpu', 'memory', 'falla', 'agotado'];
-  const mediumKeywords = ['warning', 'slow', 'degraded', 'timeout', 'lento', 'advertencia'];
+  const criticalKeywords = ['down', 'outage', 'critical', 'unavailable', 'emergency'];
+  const highKeywords = ['error', 'failure', 'exhausted', 'high cpu', 'memory', 'failed'];
+  const mediumKeywords = ['warning', 'slow', 'degraded', 'timeout', 'latency'];
 
   if (criticalKeywords.some((kw) => lowerText.includes(kw))) {
     severity = 'CRITICAL';
@@ -43,11 +49,10 @@ function classifyAlert(text: string): ClassifiedIncident {
 
   const serviceKeywords: Record<string, string> = {
     payment: 'Payment Service',
-    pago: 'Payment Service',
     auth: 'Authentication Service',
     api: 'API Gateway',
     database: 'Database',
-    'base de datos': 'Database',
+    db: 'Database',
     cache: 'Cache Service',
     notification: 'Notification Service',
   };
@@ -68,6 +73,7 @@ function classifyAlert(text: string): ClassifiedIncident {
   };
 
   return {
+    id: generateIncidentId(),
     severity,
     service,
     emoji: emojiMap[severity],
@@ -75,7 +81,7 @@ function classifyAlert(text: string): ClassifiedIncident {
   };
 }
 
-// ==================== REAL-TIME SEARCH (HISTORICO) ====================
+// ==================== REAL-TIME SEARCH (Incident history) ====================
 
 interface HistoricalIncident {
   title: string;
@@ -87,60 +93,60 @@ interface HistoricalIncident {
 const historicalDatabase: Record<string, HistoricalIncident[]> = {
   'Payment Service': [
     {
-      title: 'Payment Service timeout bajo alta carga',
-      resolution: 'Se escalo el numero de pods de 3 a 8 y se aumento el timeout de 5s a 15s',
+      title: 'Payment Service timeout under high load',
+      resolution: 'Scaled pods from 3 to 8 and increased timeout from 5s to 15s',
       timeToResolveMinutes: 28,
       occurredDaysAgo: 14,
     },
     {
-      title: 'Payment Service caido tras deploy',
-      resolution: 'Rollback al deploy anterior, el nuevo build tenia una variable de entorno faltante',
+      title: 'Payment Service down after deploy',
+      resolution: 'Rolled back to previous deploy, the new build had a missing environment variable',
       timeToResolveMinutes: 12,
       occurredDaysAgo: 45,
     },
   ],
   Database: [
     {
-      title: 'Database connection pool agotado',
-      resolution: 'Se habilito connection pooling y se redujeron las conexiones max de 500 a 100',
+      title: 'Database connection pool exhausted',
+      resolution: 'Enabled connection pooling and reduced max connections from 500 to 100',
       timeToResolveMinutes: 35,
       occurredDaysAgo: 7,
     },
     {
-      title: 'Database con latencia alta en queries',
-      resolution: 'Se agrego un indice faltante en la tabla de transacciones',
+      title: 'Database high query latency',
+      resolution: 'Added a missing index on the transactions table',
       timeToResolveMinutes: 50,
       occurredDaysAgo: 30,
     },
   ],
   'API Gateway': [
     {
-      title: 'API Gateway con memory leak',
-      resolution: 'Se reinicio el servicio y se aplico el fix del commit abc123 en el siguiente deploy',
+      title: 'API Gateway memory leak',
+      resolution: 'Restarted the service and applied the fix from commit abc123 in the next deploy',
       timeToResolveMinutes: 20,
       occurredDaysAgo: 10,
     },
   ],
   'Cache Service': [
     {
-      title: 'Cache Service con hit rate bajo',
-      resolution: 'Se aumento el TTL de las claves frecuentes y se aumento la memoria asignada',
+      title: 'Cache Service low hit rate',
+      resolution: 'Increased TTL for frequently accessed keys and increased allocated memory',
       timeToResolveMinutes: 40,
       occurredDaysAgo: 21,
     },
   ],
   'Authentication Service': [
     {
-      title: 'Authentication Service rechazando tokens validos',
-      resolution: 'El reloj del servidor estaba desincronizado, se resincronizo con NTP',
+      title: 'Authentication Service rejecting valid tokens',
+      resolution: 'Server clock was out of sync, resynced with NTP',
       timeToResolveMinutes: 18,
       occurredDaysAgo: 5,
     },
   ],
   'Notification Service': [
     {
-      title: 'Notification Service con cola atascada',
-      resolution: 'Se purgaron mensajes duplicados en la cola y se reinicio el worker',
+      title: 'Notification Service queue stuck',
+      resolution: 'Purged duplicate messages from the queue and restarted the worker',
       timeToResolveMinutes: 22,
       occurredDaysAgo: 18,
     },
@@ -151,94 +157,88 @@ function searchHistoricalIncidents(service: string): HistoricalIncident[] {
   return historicalDatabase[service] || [];
 }
 
-// ==================== ESCALACION (MCP) ====================
+// ==================== INCIDENT STORE (for MCP escalation) ====================
 
-interface EscalationResult {
-  channelId: string;
-  channelName: string;
+interface IncidentRecord {
+  classification: ClassifiedIncident;
+  originalText: string;
+  similarIncidents: HistoricalIncident[];
 }
 
-async function escalateIncident(
-  client: any,
-  classification: ClassifiedIncident,
-  reporterId: string | undefined,
-  originalText: string
-): Promise<EscalationResult | null> {
-  const channelName = `incident-${Date.now().toString(36)}`.toLowerCase();
+// In-memory store so the "Escalate" button (and auto-escalation) can look up
+// the full incident context by Incident ID. Fine for a hackathon demo;
+// would move to a DB for production use.
+const incidentStore = new Map<string, IncidentRecord>();
 
-  try {
-    const createResult = await client.conversations.create({
-      name: channelName,
-      is_private: false,
-    });
+function toMcpSimilarIncidents(similar: HistoricalIncident[]) {
+  return similar.map((inc) => ({
+    title: inc.title,
+    time_ago: `${inc.occurredDaysAgo} days ago`,
+    resolved_in: `${inc.timeToResolveMinutes} min`,
+    resolution: inc.resolution,
+  }));
+}
 
-    const channelId = createResult.channel.id;
-    const channelNameActual = createResult.channel.name;
+async function runEscalation(record: IncidentRecord, say: any) {
+  const result = await escalateViaMcp({
+    incident_id: record.classification.id,
+    severity: record.classification.severity,
+    service: record.classification.service,
+    confidence: record.classification.confidence,
+    original_message: record.originalText,
+    similar_incidents: toMcpSimilarIncidents(record.similarIncidents),
+  });
 
-    if (reporterId) {
-      try {
-        await client.conversations.invite({
-          channel: channelId,
-          users: reporterId,
-        });
-      } catch (inviteError) {
-        console.log('No se pudo invitar al usuario al canal:', inviteError);
-      }
-    }
-
-    await client.chat.postMessage({
-      channel: channelId,
-      text: `Incidente critico: ${classification.service}`,
+  if (result.ok && result.channel_id) {
+    await say({
+      text: `Incident escalated to #${result.channel_name}`,
       blocks: [
         {
-          type: 'header',
-          text: {
-            type: 'plain_text',
-            text: `Incidente CRITICO: ${classification.service}`,
-          },
-        },
-        {
           type: 'section',
           text: {
             type: 'mrkdwn',
-            text: `*Descripcion original:*\n${originalText}\n\n*Severidad:* ${classification.severity}\n*Servicio:* ${classification.service}`,
-          },
-        },
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: ':robot_face: Este canal fue creado automaticamente por el Incident Response Agent para coordinar la respuesta a este incidente.',
+            text:
+              `:rotating_light: *Incident escalated via MCP*\n` +
+              `A dedicated channel <#${result.channel_id}> was created, briefed with incident context and history, and the on-call engineer was notified.`,
           },
         },
       ],
     });
-
-    return { channelId, channelName: channelNameActual };
-  } catch (error) {
-    console.error('Error creando canal de escalacion:', error);
-    return null;
+  } else {
+    await say(
+      `:warning: Could not escalate this incident via MCP (${result.error || 'unknown error'}). Check the bot permissions (channels:manage) and that ONCALL_USER_ID is set in .env.local.`
+    );
   }
 }
 
 // ==================== HANDLER ====================
 
-app.message(async ({ message, say, client }) => {
+app.message(async ({ message, say }) => {
   const msg = message as any;
   if (!msg.text) return;
+  if (msg.subtype) return;
+  if (msg.bot_id) return;
 
-  console.log('Mensaje recibido:', msg.text);
+  console.log('Message received:', msg.text);
 
   const classification = classifyAlert(msg.text);
+  const similarIncidents = searchHistoricalIncidents(classification.service);
+
+  // Save context so the Escalate button (and auto-escalation below) can use it
+  incidentStore.set(classification.id, {
+    classification,
+    originalText: msg.text,
+    similarIncidents,
+  });
 
   await say({
-    text: `Incidente clasificado: ${classification.severity}`,
+    text: `Incident classified: ${classification.severity}`,
     blocks: [
       {
         type: 'header',
         text: {
           type: 'plain_text',
-          text: `Incidente clasificado: ${classification.severity}`,
+          text: `Incident classified: ${classification.severity}`,
         },
       },
       {
@@ -246,19 +246,23 @@ app.message(async ({ message, say, client }) => {
         fields: [
           {
             type: 'mrkdwn',
-            text: `*Severidad:*\n${classification.emoji} ${classification.severity}`,
+            text: `*Incident ID:*\n${classification.id}`,
           },
           {
             type: 'mrkdwn',
-            text: `*Servicio:*\n${classification.service}`,
+            text: `*Severity:*\n${classification.emoji} ${classification.severity}`,
           },
           {
             type: 'mrkdwn',
-            text: `*Confianza:*\n${(classification.confidence * 100).toFixed(0)}%`,
+            text: `*Service:*\n${classification.service}`,
           },
           {
             type: 'mrkdwn',
-            text: `*Descripcion original:*\n${msg.text}`,
+            text: `*Confidence:*\n${(classification.confidence * 100).toFixed(0)}%`,
+          },
+          {
+            type: 'mrkdwn',
+            text: `*Original message:*\n${msg.text}`,
           },
         ],
       },
@@ -269,43 +273,43 @@ app.message(async ({ message, say, client }) => {
             type: 'button',
             text: {
               type: 'plain_text',
-              text: 'Resolver',
+              text: 'Resolve',
             },
             action_id: 'incident_resolve',
             style: 'primary',
+            value: classification.id,
           },
           {
             type: 'button',
             text: {
               type: 'plain_text',
-              text: 'Escalar',
+              text: 'Escalate',
             },
             action_id: 'incident_escalate',
             style: 'danger',
+            value: classification.id,
           },
         ],
       },
     ],
   });
 
-  // ===== Buscar contexto historico (Real-Time Search) =====
-  const similarIncidents = searchHistoricalIncidents(classification.service);
-
+  // ===== Search historical context (Real-Time Search) =====
   if (similarIncidents.length > 0) {
     const historyText = similarIncidents
       .map((inc) => {
-        return `*${inc.title}*\n_Hace ${inc.occurredDaysAgo} dias - resuelto en ${inc.timeToResolveMinutes} min_\nSolucion: ${inc.resolution}`;
+        return `*${inc.title}*\n_${inc.occurredDaysAgo} days ago - resolved in ${inc.timeToResolveMinutes} min_\nResolution: ${inc.resolution}`;
       })
       .join('\n\n');
 
     await say({
-      text: `Incidentes similares encontrados (${similarIncidents.length})`,
+      text: `Found ${similarIncidents.length} similar incident(s)`,
       blocks: [
         {
           type: 'section',
           text: {
             type: 'mrkdwn',
-            text: `:mag: *Incidentes similares encontrados (${similarIncidents.length})*\n\n${historyText}`,
+            text: `:mag: *Similar incidents found (${similarIncidents.length})*\n\n${historyText}`,
           },
         },
         {
@@ -313,7 +317,7 @@ app.message(async ({ message, say, client }) => {
           elements: [
             {
               type: 'mrkdwn',
-              text: 'Resultados de Real-Time Search sobre el historial de incidentes',
+              text: 'Results from Real-Time Search over incident history',
             },
           ],
         },
@@ -321,57 +325,63 @@ app.message(async ({ message, say, client }) => {
     });
   } else {
     await say({
-      text: 'No se encontraron incidentes historicos similares',
+      text: 'No similar historical incidents found',
       blocks: [
         {
           type: 'section',
           text: {
             type: 'mrkdwn',
-            text: `:mag: No se encontraron incidentes historicos similares para *${classification.service}*. Este podria ser un caso nuevo.`,
+            text: `:mag: No similar historical incidents found for *${classification.service}*. This could be a new type of issue.`,
           },
         },
       ],
     });
   }
 
-  // ===== Escalacion automatica (MCP) =====
+  // ===== Automatic escalation via MCP =====
   if (classification.severity === 'CRITICAL') {
-    const escalation = await escalateIncident(client, classification, msg.user, msg.text);
-
-    if (escalation) {
-      await say({
-        text: `Incidente escalado automaticamente a #${escalation.channelName}`,
-        blocks: [
-          {
-            type: 'section',
-            text: {
-              type: 'mrkdwn',
-              text: `:rotating_light: *Incidente escalado automaticamente*\nSe creo el canal <#${escalation.channelId}> para coordinar la respuesta a este incidente.`,
-            },
-          },
-        ],
-      });
-    } else {
-      await say('No se pudo escalar automaticamente el incidente. Revisa los permisos del bot (channels:manage).');
-    }
+    await say(':rotating_light: Severity is CRITICAL — escalating automatically via MCP...');
+    const record = incidentStore.get(classification.id)!;
+    await runEscalation(record, say);
   }
 });
 
-// ==================== ACCIONES ====================
+// ==================== ACTIONS ====================
 
-app.action('incident_resolve', async ({ ack, say }) => {
+app.action('incident_resolve', async ({ ack, say, body }) => {
   await ack();
-  if (say) await say('Incidente marcado como resuelto.');
+  const incidentId = (body as any).actions?.[0]?.value;
+  if (say) {
+    await say(
+      incidentId
+        ? `Incident *${incidentId}* marked as resolved.`
+        : 'Incident marked as resolved.'
+    );
+  }
 });
 
-app.action('incident_escalate', async ({ ack, say }) => {
+app.action('incident_escalate', async ({ ack, say, body }) => {
   await ack();
-  if (say) await say('Incidente escalado al equipo on-call.');
+
+  const incidentId = (body as any).actions?.[0]?.value;
+  const record = incidentId ? incidentStore.get(incidentId) : undefined;
+
+  if (!record) {
+    if (say) {
+      await say('Could not find incident details to escalate. Please classify a new alert first.');
+    }
+    return;
+  }
+
+  if (say) {
+    await say(`:hourglass_flowing_sand: Escalating *${record.classification.id}* via MCP...`);
+    await runEscalation(record, say);
+  }
 });
 
 // ==================== START ====================
 
 (async () => {
   await app.start(3000);
-  console.log('Bot escuchando en puerto 3000');
+  console.log('Bot listening on port 3000');
 })();
